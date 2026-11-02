@@ -1,4 +1,5 @@
 #include "utils_1d.h"
+#include <limits.h>
 
 /* Implement the MPI solver here. You may add includes and helper functions.
  * Keep the explicit finite difference scheme and the public signature.
@@ -18,32 +19,89 @@
  * @return 0 on success, -1 on error.
  */
 int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
-  // Setup the parameters
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+  if (heat_array == NULL || err == NULL || num_pts == 0 ||
+      num_pts > (size_t)INT_MAX) {
+    return -1;
+  }
+
+  // Setup the parameters.  The boundary values are fixed at zero.
   double dx = 1.0/(num_pts+1);
   double dt = 0.5*dx*dx;
-  size_t beg = 1;
-  size_t end = beg + num_pts - 1;
+  const double alpha = dt/(dx*dx);
 
-  // Utilize an auxiliary array to store the new temperatures
-  double *aux = (double *) malloc((num_pts + 2) * sizeof(double));
-
-  for (size_t i = 0; i < ITER; i++){
-
-    // Set boundary conditions to 0
-    aux[beg - 1] = 0.0;
-    aux[end + 1] = 0.0;
-
-    // Compute temperatures at new time step
-    for (size_t j = beg; j <= end; j++){
-      aux[j] = heat_array[j] + dt/(dx*dx)*(heat_array[j-1] - 2.0*heat_array[j] + heat_array[j+1]);
-      *err += dx*fabs(aux[j] - heat_array[j]);
-    }
-
-    // Copy back into the original array
-    for (size_t j = beg; j <= end; j++){
-      heat_array[j] = aux[j];
-    }
+  int *counts = malloc((size_t)size * sizeof(*counts));
+  int *displs = malloc((size_t)size * sizeof(*displs));
+  if (counts == NULL || displs == NULL) {
+    free(counts);
+    free(displs);
+    return -1;
   }
-  free(aux);
+
+  size_t base = num_pts / (size_t)size;
+  size_t remainder = num_pts % (size_t)size;
+  size_t offset = 0;
+  for (int r = 0; r < size; ++r) {
+    size_t n = base + ((size_t)r < remainder ? 1 : 0);
+    if (n > (size_t)INT_MAX || offset > (size_t)INT_MAX) {
+      free(counts);
+      free(displs);
+      return -1;
+    }
+    counts[r] = (int)n;
+    displs[r] = (int)offset;
+    offset += n;
+  }
+
+  int local_n = counts[rank];
+  double *current = malloc((size_t)(local_n + 2) * sizeof(*current));
+  double *next = malloc((size_t)(local_n + 2) * sizeof(*next));
+  if (current == NULL || next == NULL) {
+    free(current);
+    free(next);
+    free(counts);
+    free(displs);
+    return -1;
+  }
+
+  MPI_Scatterv(heat_array + 1, counts, displs, MPI_DOUBLE,
+               current + 1, local_n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+  current[0] = 0.0;
+  current[local_n + 1] = 0.0;
+  *err = 0.0;
+
+  double local_err = 0.0;
+  for (size_t step = 0; step < ITER; ++step) {
+    int left = (rank == 0) ? MPI_PROC_NULL : rank - 1;
+    int right = (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
+    MPI_Sendrecv(&current[1], 1, MPI_DOUBLE, left, 0,
+                 &current[local_n + 1], 1, MPI_DOUBLE, right, 0,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Sendrecv(&current[local_n], 1, MPI_DOUBLE, right, 1,
+                 &current[0], 1, MPI_DOUBLE, left, 1,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    for (int j = 1; j <= local_n; ++j) {
+      next[j] = current[j] + alpha *
+          (current[j - 1] - 2.0 * current[j] + current[j + 1]);
+      local_err += dx * fabs(next[j] - current[j]);
+    }
+    double *tmp = current;
+    current = next;
+    next = tmp;
+  }
+
+  MPI_Gatherv(current + 1, local_n, MPI_DOUBLE,
+              heat_array + 1, counts, displs, MPI_DOUBLE,
+              0, MPI_COMM_WORLD);
+  MPI_Reduce(&local_err, err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+  free(current);
+  free(next);
+  free(counts);
+  free(displs);
   return 0;
 }
