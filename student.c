@@ -77,18 +77,38 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
   for (size_t step = 0; step < ITER; ++step) {
     int left = (rank == 0) ? MPI_PROC_NULL : rank - 1;
     int right = (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
-    MPI_Sendrecv(&current[1], 1, MPI_DOUBLE, left, 0,
-                 &current[local_n + 1], 1, MPI_DOUBLE, right, 0,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    MPI_Sendrecv(&current[local_n], 1, MPI_DOUBLE, right, 1,
-                 &current[0], 1, MPI_DOUBLE, left, 1,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    for (int j = 1; j <= local_n; ++j) {
+    MPI_Request requests[4];
+    MPI_Irecv(&current[0], 1, MPI_DOUBLE, left, 1,
+              MPI_COMM_WORLD, &requests[0]);
+    MPI_Irecv(&current[local_n + 1], 1, MPI_DOUBLE, right, 0,
+              MPI_COMM_WORLD, &requests[1]);
+    MPI_Isend(&current[1], 1, MPI_DOUBLE, left, 0,
+              MPI_COMM_WORLD, &requests[2]);
+    MPI_Isend(&current[local_n], 1, MPI_DOUBLE, right, 1,
+              MPI_COMM_WORLD, &requests[3]);
+
+    /* The inner points do not depend on the halo values. */
+    for (int j = 2; j < local_n; ++j) {
       next[j] = current[j] + alpha *
           (current[j - 1] - 2.0 * current[j] + current[j + 1]);
       local_err += dx * fabs(next[j] - current[j]);
     }
+
+    MPI_Waitall(4, requests, MPI_STATUSES_IGNORE);
+
+    if (local_n >= 1) {
+      next[1] = current[1] + alpha *
+          (current[0] - 2.0 * current[1] + current[2]);
+      local_err += dx * fabs(next[1] - current[1]);
+    }
+    if (local_n >= 2) {
+      next[local_n] = current[local_n] + alpha *
+          (current[local_n - 1] - 2.0 * current[local_n] +
+           current[local_n + 1]);
+      local_err += dx * fabs(next[local_n] - current[local_n]);
+    }
+
     double *tmp = current;
     current = next;
     next = tmp;
