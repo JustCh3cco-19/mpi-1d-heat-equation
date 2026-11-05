@@ -30,8 +30,7 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
 
   // Setup the parameters.  The boundary values are fixed at zero.
   double dx = 1.0/(num_pts+1);
-  double dt = 0.5*dx*dx;
-  const double alpha = dt/(dx*dx);
+  const double half_alpha = 0.5;
 
   int *counts = malloc((size_t)size * sizeof(*counts));
   int *displs = malloc((size_t)size * sizeof(*displs));
@@ -89,23 +88,26 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
               MPI_COMM_WORLD, &requests[3]);
 
     /* The inner points do not depend on the halo values. */
+    const double *left_ptr = current + 1;
+    const double *right_ptr = current + 3;
+    double *next_ptr = next + 2;
     for (int j = 2; j < local_n; ++j) {
-      next[j] = current[j] + alpha *
-          (current[j - 1] - 2.0 * current[j] + current[j + 1]);
-      local_err += dx * fabs(next[j] - current[j]);
+      *next_ptr = half_alpha * (*left_ptr + *right_ptr);
+      local_err += dx * fabs(*next_ptr - current[j]);
+      ++left_ptr;
+      ++right_ptr;
+      ++next_ptr;
     }
 
     MPI_Waitall(4, requests, MPI_STATUSES_IGNORE);
 
     if (local_n >= 1) {
-      next[1] = current[1] + alpha *
-          (current[0] - 2.0 * current[1] + current[2]);
+      next[1] = half_alpha * (current[0] + current[2]);
       local_err += dx * fabs(next[1] - current[1]);
     }
     if (local_n >= 2) {
-      next[local_n] = current[local_n] + alpha *
-          (current[local_n - 1] - 2.0 * current[local_n] +
-           current[local_n + 1]);
+      next[local_n] = half_alpha *
+          (current[local_n - 1] + current[local_n + 1]);
       local_err += dx * fabs(next[local_n] - current[local_n]);
     }
 

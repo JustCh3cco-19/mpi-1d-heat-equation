@@ -5,4 +5,6 @@
 # CPPFLAGS += -DMY_OPTION=1
 # LDFLAGS += -L/path/to/libraries
 # LDLIBS += -lmy_library
+
+CFLAGS += -O3 -ffast-math -march=native -funroll-loops
 # Command-line assignments take precedence, e.g. make CFLAGS="-O2 -Wall".
