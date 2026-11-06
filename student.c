@@ -1,90 +1,353 @@
 #include "utils_1d.h"
 #include <limits.h>
 
-int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts) {
-  int rank, size;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-  if (!heat_array || !err || !num_pts || num_pts > INT_MAX) return -1;
+/* Local comparisons of 1, 8, 16, 32, 64 and 128 steps favored 64 as a
+ * compromise across domain sizes. Override at build time for another MPI
+ * system, e.g. CPPFLAGS+=-DHEAT_HALO_STEPS=128 in student.mk. */
+#ifndef HEAT_HALO_STEPS
+#define HEAT_HALO_STEPS 64
+#endif
 
-  const double dx = 1.0 / (num_pts + 1);
-  *err = 0.0;
-  if (num_pts < (size_t)size) {
-    if (rank == 0) {
-      double *next = malloc((num_pts + 2) * sizeof(double));
-      if (!next) return -1;
-      next[0] = next[num_pts + 1] = 0.0;
-      double *a = heat_array, *b = next;
-      for (int step = 0; step < ITER; ++step) {
-        for (size_t j = 1; j <= num_pts; ++j) {
-          b[j] = 0.5 * (a[j-1] + a[j+1]);
-          *err += dx * fabs(b[j] - a[j]);
-        }
-        double *tmp = a; a = b; b = tmp;
-      }
-      if (a != heat_array) memcpy(heat_array + 1, a + 1, num_pts * sizeof(double));
-      free(next);
-    }
-    return 0;
+#if HEAT_HALO_STEPS < 1 || HEAT_HALO_STEPS > INT_MAX
+#error "HEAT_HALO_STEPS must be a positive MPI int count"
+#endif
+
+typedef struct {
+  double left;
+  double right;
+} BoundaryValues;
+
+typedef struct {
+  double *heat_array;
+  double *err;
+  size_t num_pts;
+  double dx;
+  BoundaryValues boundaries;
+} HeatProblem;
+
+typedef struct {
+  int rank;
+  int size;
+} MpiContext;
+
+typedef struct {
+  double *current;
+  double *next;
+} TimeLevels;
+
+/* A kernel receives a read/write view with disjoint buffers. Keep restrict
+ * here, scoped to a single update, rather than on the time levels we swap. */
+typedef struct {
+  const double *restrict current;
+  double *restrict next;
+} UpdateBuffers;
+
+/* Update [lo, hi], but accumulate error only for owned points [first, last]. */
+typedef struct {
+  size_t lo;
+  size_t hi;
+  size_t first;
+  size_t last;
+  int physical_left;
+  int physical_right;
+} UpdateRegion;
+
+/* Buffer layout: [padding][left halo][owned points][right halo][padding].
+ * Only the owned interval [first, last] contributes to cumulative error. */
+typedef struct {
+  size_t count;
+  size_t offset;
+  size_t first;
+  size_t last;
+  int halo_steps;
+  int left_rank;
+  int right_rank;
+  TimeLevels values;
+  int *counts;
+  int *displacements;
+} LocalDomain;
+
+static inline void swap_buffers(TimeLevels *values) {
+  double *temporary = values->current;
+  values->current = values->next;
+  values->next = temporary;
+}
+
+static inline UpdateBuffers update_buffers(const TimeLevels *values) {
+  return (UpdateBuffers){.current = values->current, .next = values->next};
+}
+
+/* The owned interval contributes to the error; the surrounding points only
+ * supply dependencies for later steps. Separate allocations never overlap. */
+static inline double update_range(UpdateBuffers buffers, UpdateRegion region, double dx) {
+  const double *a = buffers.current;
+  double *b = buffers.next;
+  const size_t lo = region.lo, hi = region.hi;
+  const size_t first = region.first, last = region.last;
+  for (size_t j = lo; j < first; ++j)
+    b[j] = 0.5 * (a[j-1] + a[j+1]);
+  double sum = 0.0;
+  for (size_t j = first; j <= last; ++j) {
+    double value = 0.5 * (a[j-1] + a[j+1]);
+    b[j] = value;
+    /* Scale each contribution before summing: the unscaled total can
+     * overflow even when the requested cumulative error is finite. */
+    sum += dx * fabs(value - a[j]);
   }
+  for (size_t j = last + 1; j <= hi; ++j)
+    b[j] = 0.5 * (a[j-1] + a[j+1]);
+  return sum;
+}
 
-  const int base = (int)(num_pts / (size_t)size);
+/* Evaluate two consecutive explicit steps without storing a full intermediate
+ * array. Every intermediate temperature still uses the original stencil, and
+ * both time levels contribute to the error. Only the physical endpoints have
+ * a fixed intermediate value; process boundaries use the received halos. */
+static inline double update_pair(UpdateBuffers buffers, UpdateRegion region, double dx) {
+  const double *a = buffers.current;
+  double *b = buffers.next;
+  const size_t lo = region.lo, hi = region.hi;
+  const size_t first = region.first, last = region.last;
+  const int physical_left = region.physical_left;
+  const int physical_right = region.physical_right;
+  double sum = 0.0;
+  if (first == last && physical_left && physical_right) {
+    double mid = 0.5 * (a[first-1] + a[first+1]);
+    b[first] = mid;
+    return dx * fabs(mid - a[first]);
+  }
+  for (size_t j = lo; j < first; ++j) {
+    double left_mid = 0.5 * (a[j-2] + a[j]);
+    double right_mid = 0.5 * (a[j] + a[j+2]);
+    b[j] = 0.5 * (left_mid + right_mid);
+  }
+  size_t begin = first + (size_t)physical_left;
+  size_t end = last - (size_t)physical_right;
+  for (size_t j = begin; j <= end; ++j) {
+    double left_mid = 0.5 * (a[j-2] + a[j]);
+    double mid = 0.5 * (a[j-1] + a[j+1]);
+    double right_mid = 0.5 * (a[j] + a[j+2]);
+    double value = 0.5 * (left_mid + right_mid);
+    b[j] = value;
+    sum += dx * fabs(mid - a[j]) + dx * fabs(value - mid);
+  }
+  if (physical_left) {
+    double mid = 0.5 * (a[first-1] + a[first+1]);
+    double right_mid = 0.5 * (a[first] + a[first+2]);
+    double value = 0.5 * (a[first-1] + right_mid);
+    b[first] = value;
+    sum += dx * fabs(mid - a[first]) + dx * fabs(value - mid);
+  }
+  if (physical_right) {
+    double left_mid = 0.5 * (a[last-2] + a[last]);
+    double mid = 0.5 * (a[last-1] + a[last+1]);
+    double value = 0.5 * (left_mid + a[last+1]);
+    b[last] = value;
+    sum += dx * fabs(mid - a[last]) + dx * fabs(value - mid);
+  }
+  for (size_t j = last + 1; j <= hi; ++j) {
+    double left_mid = 0.5 * (a[j-2] + a[j]);
+    double right_mid = 0.5 * (a[j] + a[j+2]);
+    b[j] = 0.5 * (left_mid + right_mid);
+  }
+  return sum;
+}
+
+/* Single-process path, also used when there are fewer points than ranks. */
+static int solve_sequential(const HeatProblem *problem) {
+  const size_t num_pts = problem->num_pts;
+  double *scratch = malloc((num_pts + 2) * sizeof(double));
+  if (!scratch) return -1;
+  scratch[0] = problem->boundaries.left;
+  scratch[num_pts + 1] = problem->boundaries.right;
+
+  TimeLevels values = {.current = problem->heat_array, .next = scratch};
+  const UpdateRegion region = {
+    .lo = 1, .hi = num_pts, .first = 1, .last = num_pts,
+    .physical_left = 1, .physical_right = 1
+  };
+  double sum = 0.0;
+  int step = 0;
+  for (; step + 1 < ITER; step += 2) {
+    sum += update_pair(update_buffers(&values), region, problem->dx);
+    swap_buffers(&values);
+  }
+  if (step < ITER) {
+    sum += update_range(update_buffers(&values), region, problem->dx);
+    swap_buffers(&values);
+  }
+  *problem->err = sum;
+  if (values.current != problem->heat_array)
+    memcpy(problem->heat_array + 1, values.current + 1, num_pts * sizeof(double));
+  free(scratch);
+  return 0;
+}
+
+static void destroy_domain(LocalDomain *domain) {
+  free(domain->values.current);
+  free(domain->values.next);
+  free(domain->counts);
+  free(domain->displacements);
+}
+
+/* Build the balanced partition and allocate the two local time levels.
+ * The caller initializes domain to zero and releases it even on failure. */
+static int create_domain(LocalDomain *domain, const HeatProblem *problem,
+                         const MpiContext *mpi) {
+  const size_t num_pts = problem->num_pts;
+  const int rank = mpi->rank, size = mpi->size;
+  const size_t base = num_pts / (size_t)size;
   const int rem = (int)(num_pts % (size_t)size);
-  const int n = base + (rank < rem);
-  const int offset = rank * base + (rank < rem ? rank : rem);
-  int width = base < 16 ? base : 16;
-  const int own_lo = width + 1, own_hi = width + n;
-  const int phys_lo = width - offset;
-  const int phys_hi = width + (int)num_pts - offset + 1;
-  double *a = malloc((size_t)(n + 2 * width + 2) * sizeof(double));
-  double *b = malloc((size_t)(n + 2 * width + 2) * sizeof(double));
-  int *counts = malloc((size_t)size * sizeof(int));
-  int *displs = malloc((size_t)size * sizeof(int));
-  if (!a || !b || !counts || !displs) {
-    free(a); free(b); free(counts); free(displs);
+  domain->count = base + (rank < rem);
+  domain->offset = (size_t)rank * base + (size_t)(rank < rem ? rank : rem);
+  domain->halo_steps = base < (size_t)HEAT_HALO_STEPS ? (int)base : HEAT_HALO_STEPS;
+  domain->first = (size_t)domain->halo_steps + 1;
+  domain->last = domain->first + domain->count - 1;
+  domain->left_rank = rank ? rank - 1 : MPI_PROC_NULL;
+  domain->right_rank = rank + 1 < size ? rank + 1 : MPI_PROC_NULL;
+
+  const size_t buffer_count = domain->count + 2 * (size_t)domain->halo_steps + 2;
+  if (buffer_count > SIZE_MAX / sizeof(double)) return -1;
+  domain->values.current = malloc(buffer_count * sizeof(double));
+  domain->values.next = malloc(buffer_count * sizeof(double));
+  domain->counts = malloc((size_t)size * sizeof(int));
+  domain->displacements = malloc((size_t)size * sizeof(int));
+  if (!domain->values.current || !domain->values.next || !domain->counts || !domain->displacements)
     return -1;
-  }
+
   for (int r = 0; r < size; ++r) {
-    counts[r] = base + (r < rem);
-    displs[r] = r * base + (r < rem ? r : rem);
+    domain->counts[r] = (int)(base + (r < rem));
+    domain->displacements[r] = (int)((size_t)r * base + (size_t)(r < rem ? r : rem));
   }
-  memcpy(a + own_lo, heat_array + offset + 1, (size_t)n * sizeof(double));
+  memcpy(domain->values.current + domain->first, problem->heat_array + domain->offset + 1,
+         domain->count * sizeof(double));
+  return 0;
+}
+
+static inline void set_boundaries(double *values, const LocalDomain *domain,
+                                  BoundaryValues boundaries) {
+  if (domain->left_rank == MPI_PROC_NULL)
+    values[domain->first - 1] = boundaries.left;
+  if (domain->right_rank == MPI_PROC_NULL)
+    values[domain->last + 1] = boundaries.right;
+}
+
+static inline void start_halo_exchange(const LocalDomain *domain, double *current,
+                                       MPI_Request requests[4]) {
+  const int width = domain->halo_steps;
+  const size_t halo = (size_t)width;
+  MPI_Irecv(current + domain->first - halo, width, MPI_DOUBLE,
+            domain->left_rank, 0, MPI_COMM_WORLD, &requests[0]);
+  MPI_Irecv(current + domain->last + 1, width, MPI_DOUBLE,
+            domain->right_rank, 1, MPI_COMM_WORLD, &requests[1]);
+  MPI_Isend(current + domain->first, width, MPI_DOUBLE,
+            domain->left_rank, 1, MPI_COMM_WORLD, &requests[2]);
+  MPI_Isend(current + domain->last - halo + 1, width, MPI_DOUBLE,
+            domain->right_rank, 0, MPI_COMM_WORLD, &requests[3]);
+}
+
+/* Advance local time levels; wait for every request before swapping buffers. */
+static double evolve_domain(LocalDomain *domain, const HeatProblem *problem) {
+  TimeLevels values = domain->values;
+  const double dx = problem->dx;
+  const BoundaryValues boundaries = problem->boundaries;
+  const size_t first = domain->first;
+  const size_t last = domain->last;
+  const int physical_left = domain->left_rank == MPI_PROC_NULL;
+  const int physical_right = domain->right_rank == MPI_PROC_NULL;
+  const UpdateRegion interior = {
+    .lo = first + 1, .hi = last - 1,
+    .first = first + 1, .last = last - 1
+  };
+  UpdateRegion left_edge = {.hi = first, .first = first, .last = first};
+  UpdateRegion right_edge = {.lo = last, .first = last, .last = last};
+  UpdateRegion owned = {
+    .first = first, .last = last,
+    .physical_left = physical_left, .physical_right = physical_right
+  };
   double local_err = 0.0;
-  const int left = rank ? rank - 1 : MPI_PROC_NULL;
-  const int right = rank + 1 < size ? rank + 1 : MPI_PROC_NULL;
 
   for (int step = 0; step < ITER; ) {
-    int chunk = ITER - step < width ? ITER - step : width;
-    MPI_Request req[4];
-    MPI_Irecv(a + own_lo - width, width, MPI_DOUBLE, left, 0, MPI_COMM_WORLD, &req[0]);
-    MPI_Irecv(a + own_hi + 1, width, MPI_DOUBLE, right, 1, MPI_COMM_WORLD, &req[1]);
-    MPI_Isend(a + own_lo, width, MPI_DOUBLE, left, 1, MPI_COMM_WORLD, &req[2]);
-    MPI_Isend(a + own_hi - width + 1, width, MPI_DOUBLE, right, 0, MPI_COMM_WORLD, &req[3]);
-    MPI_Waitall(4, req, MPI_STATUSES_IGNORE);
-    if (left == MPI_PROC_NULL) a[phys_lo] = 0.0;
-    if (right == MPI_PROC_NULL) a[phys_hi] = 0.0;
+    int chunk = ITER - step < domain->halo_steps ? ITER - step : domain->halo_steps;
+    MPI_Request requests[4];
+    start_halo_exchange(domain, values.current, requests);
 
-    for (int t = 0; t < chunk; ++t) {
-      int halo = chunk - t - 1;
-      int lo = own_lo - halo;
-      int hi = own_hi + halo;
-      if (lo <= phys_lo) lo = phys_lo + 1;
-      if (hi >= phys_hi) hi = phys_hi - 1;
-      if (left == MPI_PROC_NULL) b[phys_lo] = 0.0;
-      if (right == MPI_PROC_NULL) b[phys_hi] = 0.0;
-      for (int j = lo; j < own_lo; ++j) b[j] = 0.5 * (a[j-1] + a[j+1]);
-      for (int j = own_lo; j <= own_hi; ++j) {
-        b[j] = 0.5 * (a[j-1] + a[j+1]);
-        local_err += dx * fabs(b[j] - a[j]);
-      }
-      for (int j = own_hi + 1; j <= hi; ++j) b[j] = 0.5 * (a[j-1] + a[j+1]);
-      double *tmp = a; a = b; b = tmp;
+    /* The first step's interior reads only owned points. It neither reads
+     * the receive buffers nor modifies the send buffers while MPI is active.
+     * Keep its output in next until the boundary work is complete. */
+    if (domain->count > 2) {
+      local_err += update_range(update_buffers(&values), interior, dx);
+    }
+    MPI_Waitall(4, requests, MPI_STATUSES_IGNORE);
+    set_boundaries(values.current, domain, boundaries);
+    set_boundaries(values.next, domain, boundaries);
+
+    size_t first_halo = (size_t)(chunk - 1);
+    left_edge.lo = physical_left ? first : first - first_halo;
+    right_edge.hi = physical_right ? last : last + first_halo;
+
+    /* Complete the first step without recomputing the interior or counting
+     * a single-point subdomain twice. Halo updates do not contribute error. */
+    local_err += update_range(update_buffers(&values), left_edge, dx);
+    if (domain->count > 1) {
+      local_err += update_range(update_buffers(&values), right_edge, dx);
+    }
+    swap_buffers(&values);
+
+    for (int t = 1; t < chunk; ) {
+      int steps = chunk - t >= 2 ? 2 : 1;
+      size_t halo = (size_t)(chunk - t - steps);
+      owned.lo = physical_left ? first : first - halo;
+      owned.hi = physical_right ? last : last + halo;
+      set_boundaries(values.next, domain, boundaries);
+      if (steps == 2)
+        local_err += update_pair(update_buffers(&values), owned, dx);
+      else
+        local_err += update_range(update_buffers(&values), owned, dx);
+      swap_buffers(&values);
+      t += steps;
     }
     step += chunk;
   }
-  MPI_Gatherv(a + own_lo, n, MPI_DOUBLE, heat_array + 1, counts, displs,
+  domain->values = values;
+  return local_err;
+}
+
+static void gather_solution(const LocalDomain *domain, const HeatProblem *problem,
+                            double local_err) {
+  MPI_Gatherv(domain->values.current + domain->first, (int)domain->count, MPI_DOUBLE,
+              problem->heat_array + 1, domain->counts, domain->displacements,
               MPI_DOUBLE, 0, MPI_COMM_WORLD);
-  MPI_Reduce(&local_err, err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-  free(a); free(b); free(counts); free(displs);
+  MPI_Reduce(&local_err, problem->err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+}
+
+/* MPI is owned by the driver. Return the final array and cumulative error on
+ * rank 0, preserving the constant endpoints supplied in heat_array. */
+int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts) {
+  MpiContext mpi;
+  MPI_Comm_rank(MPI_COMM_WORLD, &mpi.rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &mpi.size);
+  /* Gatherv uses int counts and displacements; array indexing uses size_t. */
+  if (!heat_array || !err || !num_pts || num_pts > INT_MAX ||
+      num_pts > SIZE_MAX / sizeof(double) - 2 ||
+      (size_t)mpi.size > SIZE_MAX / sizeof(int)) return -1;
+
+  const HeatProblem problem = {
+    .heat_array = heat_array, .err = err, .num_pts = num_pts,
+    .dx = 1.0 / (double)(num_pts + 1),
+    .boundaries = {heat_array[0], heat_array[num_pts + 1]}
+  };
+  *err = 0.0;
+  if (mpi.size == 1 || num_pts < (size_t)mpi.size)
+    return mpi.rank == 0 ? solve_sequential(&problem) : 0;
+
+  LocalDomain domain = {0};
+  if (create_domain(&domain, &problem, &mpi) != 0) {
+    destroy_domain(&domain);
+    return -1;
+  }
+  double local_err = evolve_domain(&domain, &problem);
+  gather_solution(&domain, &problem, local_err);
+  destroy_domain(&domain);
   return 0;
 }
