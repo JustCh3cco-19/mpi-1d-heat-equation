@@ -12,6 +12,15 @@
 #error "HEAT_HALO_STEPS must be a positive MPI int count"
 #endif
 
+/* Spatial cache tile target, selected from 512, 1024, 2048, 4096 and 8192
+ * points in local comparisons. Zero disables spatial blocking. */
+#ifndef HEAT_TILE_POINTS
+#define HEAT_TILE_POINTS 4096
+#endif
+#if HEAT_TILE_POINTS < 0 || HEAT_TILE_POINTS > INT_MAX
+#error "HEAT_TILE_POINTS must be a nonnegative int"
+#endif
+
 typedef struct {
   double left;
   double right;
@@ -52,6 +61,18 @@ typedef struct {
   int physical_right;
 } UpdateRegion;
 
+typedef struct {
+  TimeLevels values;
+  size_t points;
+} TileWorkspace;
+
+typedef struct {
+  UpdateRegion region;
+  int steps;
+  double dx;
+  BoundaryValues boundaries;
+} TileUpdate;
+
 /* Buffer layout: [padding][left halo][owned points][right halo][padding].
  * Only the owned interval [first, last] contributes to cumulative error. */
 typedef struct {
@@ -63,6 +84,7 @@ typedef struct {
   int left_rank;
   int right_rank;
   TimeLevels values;
+  TileWorkspace tile;
   int *counts;
   int *displacements;
 } LocalDomain;
@@ -188,6 +210,8 @@ static void destroy_domain(LocalDomain *domain) {
   free(domain->values.next);
   free(domain->counts);
   free(domain->displacements);
+  free(domain->tile.values.current);
+  free(domain->tile.values.next);
 }
 
 /* Build the balanced partition and allocate the two local time levels.
@@ -214,6 +238,21 @@ static int create_domain(LocalDomain *domain, const HeatProblem *problem,
   domain->displacements = malloc((size_t)size * sizeof(int));
   if (!domain->values.current || !domain->values.next || !domain->counts || !domain->displacements)
     return -1;
+
+#if HEAT_TILE_POINTS > 0
+  if (domain->halo_steps > 1) {
+    size_t minimum = 2 * (size_t)domain->halo_steps;
+    size_t points = HEAT_TILE_POINTS > minimum ? HEAT_TILE_POINTS : minimum;
+    if (domain->count > points) {
+      size_t capacity = points + 2 * (size_t)domain->halo_steps + 2;
+      if (capacity > SIZE_MAX / sizeof(double)) return -1;
+      domain->tile.values.current = malloc(capacity * sizeof(double));
+      domain->tile.values.next = malloc(capacity * sizeof(double));
+      if (!domain->tile.values.current || !domain->tile.values.next) return -1;
+      domain->tile.points = points;
+    }
+  }
+#endif
 
   for (int r = 0; r < size; ++r) {
     domain->counts[r] = (int)(base + (r < rem));
@@ -244,6 +283,73 @@ static inline void start_halo_exchange(const LocalDomain *domain, double *curren
             domain->left_rank, 1, MPI_COMM_WORLD, &requests[2]);
   MPI_Isend(current + domain->last - halo + 1, width, MPI_DOUBLE,
             domain->right_rank, 0, MPI_COMM_WORLD, &requests[3]);
+}
+
+/* The input tile has steps valid halo points on each nonphysical side.
+ * Shrink that interval as the explicit updates consume their dependencies. */
+static inline double advance_tile(TimeLevels *values, const TileUpdate *update) {
+  UpdateRegion region = update->region;
+  double sum = 0.0;
+  for (int step = 0; step < update->steps; ) {
+    int steps = update->steps - step >= 2 ? 2 : 1;
+    size_t halo = (size_t)(update->steps - step - steps);
+    region.lo = region.physical_left ? region.first : region.first - halo;
+    region.hi = region.physical_right ? region.last : region.last + halo;
+    if (steps == 2)
+      sum += update_pair(update_buffers(values), region, update->dx);
+    else
+      sum += update_range(update_buffers(values), region, update->dx);
+    swap_buffers(values);
+    step += steps;
+  }
+  return sum;
+}
+
+/* Balance tile lengths so even the last tile owns at least one halo width.
+ * Thus a tile's halo cannot cross a physical boundary owned by another tile.
+ * Every tile reads the same input time level and writes to the other buffer. */
+static double advance_tiles(LocalDomain *domain, TimeLevels *values,
+                            const TileUpdate *batch) {
+  const size_t tiles = (domain->count - 1) / domain->tile.points + 1;
+  const size_t base = domain->count / tiles;
+  const size_t remainder = domain->count % tiles;
+  const size_t halo = (size_t)batch->steps;
+  double sum = 0.0;
+  size_t start = domain->first;
+
+  for (size_t tile = 0; tile < tiles; ++tile) {
+    size_t count = base + (tile < remainder);
+    size_t end = start + count - 1;
+    TileUpdate update = {
+      .region = {
+        .first = halo + 1, .last = halo + count,
+        .physical_left = batch->region.physical_left && tile == 0,
+        .physical_right = batch->region.physical_right && tile + 1 == tiles
+      },
+      .steps = batch->steps, .dx = batch->dx, .boundaries = batch->boundaries
+    };
+    const UpdateRegion *region = &update.region;
+    TimeLevels *scratch = &domain->tile.values;
+    size_t copy_first = region->physical_left ? start - 1 : start - halo;
+    size_t copy_last = region->physical_right ? end + 1 : end + halo;
+    size_t destination = region->first - (start - copy_first);
+    memcpy(scratch->current + destination, values->current + copy_first,
+           (copy_last - copy_first + 1) * sizeof(double));
+    if (region->physical_left) {
+      scratch->current[region->first - 1] = batch->boundaries.left;
+      scratch->next[region->first - 1] = batch->boundaries.left;
+    }
+    if (region->physical_right) {
+      scratch->current[region->last + 1] = batch->boundaries.right;
+      scratch->next[region->last + 1] = batch->boundaries.right;
+    }
+    sum += advance_tile(scratch, &update);
+    memcpy(values->next + start, scratch->current + region->first,
+           count * sizeof(double));
+    start = end + 1;
+  }
+  swap_buffers(values);
+  return sum;
 }
 
 /* Advance local time levels; wait for every request before swapping buffers. */
@@ -293,6 +399,15 @@ static double evolve_domain(LocalDomain *domain, const HeatProblem *problem) {
       local_err += update_range(update_buffers(&values), right_edge, dx);
     }
     swap_buffers(&values);
+
+    if (domain->tile.points && chunk > 1) {
+      const TileUpdate batch = {
+        .region = owned, .steps = chunk - 1, .dx = dx, .boundaries = boundaries
+      };
+      local_err += advance_tiles(domain, &values, &batch);
+      step += chunk;
+      continue;
+    }
 
     for (int t = 1; t < chunk; ) {
       int steps = chunk - t >= 2 ? 2 : 1;
